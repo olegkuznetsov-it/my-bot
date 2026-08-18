@@ -59,6 +59,18 @@ def init_db():
         )
         """
     )
+    # Миграция: добавляем новые колонки, если их ещё нет — нужно для баз,
+    # созданных до появления отслеживания активности пользователей.
+    for column, col_type in [
+        ("full_name", "TEXT"),
+        ("first_seen", "TEXT"),
+        ("last_start", "TEXT"),
+        ("last_request", "TEXT"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {column} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # колонка уже существует — ничего делать не нужно
     conn.commit()
     conn.close()
 
@@ -74,15 +86,65 @@ def save_message(msg_type, text=None, file_id=None, caption=None):
     conn.close()
 
 
-def register_user(user_id, username):
+def register_user(user_id, username, full_name):
     conn = get_conn()
     cur = conn.cursor()
+    now = datetime.utcnow().isoformat()
     cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, last_seen_id, username) VALUES (?, 0, ?)",
-        (user_id, username),
+        "INSERT OR IGNORE INTO users (user_id, last_seen_id, username, full_name, first_seen) "
+        "VALUES (?, 0, ?, ?, ?)",
+        (user_id, username, full_name, now),
+    )
+    # если пользователь уже был в базе — обновляем его имя/username на случай изменений
+    cur.execute(
+        "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
+        (username, full_name, user_id),
     )
     conn.commit()
     conn.close()
+
+
+def touch_start(user_id):
+    """Отмечает момент, когда пользователь нажал /start."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET last_start = ? WHERE user_id = ?",
+        (datetime.utcnow().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def touch_request(user_id):
+    """Отмечает момент, когда пользователь запросил сообщения через кнопку."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET last_request = ? WHERE user_id = ?",
+        (datetime.utcnow().isoformat(), user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_users():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users ORDER BY COALESCE(last_start, first_seen) DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def format_dt(iso_str):
+    if not iso_str:
+        return "ещё не было"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%d.%m.%Y %H:%M UTC")
+    except ValueError:
+        return iso_str
 
 
 def get_last_seen(user_id):
@@ -132,7 +194,8 @@ MAIN_KEYBOARD = InlineKeyboardMarkup(
 # ---------- Хендлеры ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    register_user(user.id, user.username or user.first_name)
+    register_user(user.id, user.username or "", user.full_name)
+    touch_start(user.id)
     is_admin = user.id in ADMIN_IDS
 
     if is_admin:
@@ -163,6 +226,34 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🗑 Готово! Все сохранённые сообщения и файлы удалены из бота.\n"
         "Пользователи больше не смогут их получить."
     )
+
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /users — доступна только админу. Показывает всех, кто пользовался ботом."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+
+    rows = get_all_users()
+    if not rows:
+        await update.message.reply_text("Пока никто не заходил в бота.")
+        return
+
+    blocks = [f"👥 Всего пользователей: {len(rows)}"]
+    for row in rows:
+        name = row["full_name"] or "Без имени"
+        username = f"@{row['username']}" if row["username"] else "без username"
+        blocks.append(
+            f"• {name} ({username}, id: {row['user_id']})\n"
+            f"   Первый заход: {format_dt(row['first_seen'])}\n"
+            f"   Последний /start: {format_dt(row['last_start'])}\n"
+            f"   Последний запрос сообщений: {format_dt(row['last_request'])}"
+        )
+
+    text = "\n\n".join(blocks)
+    # Telegram ограничивает сообщение 4096 символами — при необходимости делим на части
+    for i in range(0, len(text), 3500):
+        await update.message.reply_text(text[i : i + 3500])
 
 
 async def admin_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,7 +312,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    register_user(user.id, user.username or user.first_name)
+    register_user(user.id, user.username or "", user.full_name)
+    touch_request(user.id)
 
     if query.data == "get_new":
         last_seen = get_last_seen(user.id)
@@ -264,6 +356,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_history))
+    app.add_handler(CommandHandler("users", list_users))
     app.add_handler(CallbackQueryHandler(button_handler))
     # Ловим любой не-командный контент (текст, файлы, фото и т.д.)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, admin_content_handler))
