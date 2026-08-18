@@ -147,6 +147,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
 
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /clear — доступна только админу. Удаляет все сохранённые сообщения/файлы."""
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return  # обычные пользователи не должны даже знать об этой команде
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM messages")
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        "🗑 Готово! Все сохранённые сообщения и файлы удалены из бота.\n"
+        "Пользователи больше не смогут их получить."
+    )
+
+
 async def admin_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ловит любой контент от админа и сохраняет его. Остальным подсказывает про кнопки."""
     user = update.effective_user
@@ -245,6 +263,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CallbackQueryHandler(button_handler))
     # Ловим любой не-командный контент (текст, файлы, фото и т.д.)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, admin_content_handler))
