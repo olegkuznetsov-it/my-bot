@@ -71,6 +71,16 @@ def init_db():
             cur.execute(f"ALTER TABLE users ADD COLUMN {column} {col_type}")
         except sqlite3.OperationalError:
             pass  # колонка уже существует — ничего делать не нужно
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            telegram_message_id INTEGER NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -182,6 +192,34 @@ def get_all_messages():
     return rows
 
 
+def record_sent_message(user_id, telegram_message_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sent_messages (user_id, telegram_message_id) VALUES (?, ?)",
+        (user_id, telegram_message_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_sent_messages():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM sent_messages")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def clear_sent_messages():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sent_messages")
+    conn.commit()
+    conn.close()
+
+
 # ---------- Клавиатура ----------
 MAIN_KEYBOARD = InlineKeyboardMarkup(
     [
@@ -211,21 +249,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /clear — доступна только админу. Удаляет все сохранённые сообщения/файлы."""
+    """Команда /clear — доступна только админу.
+    Удаляет все сохранённые сообщения/файлы из базы бота, а также пытается
+    удалить их из чатов пользователей, которым они уже были отправлены.
+    """
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         return  # обычные пользователи не должны даже знать об этой команде
+
+    await update.message.reply_text("🧹 Начинаю очистку, это может занять немного времени...")
+
+    sent_rows = get_all_sent_messages()
+    deleted = 0
+    failed = 0
+    for row in sent_rows:
+        try:
+            await context.bot.delete_message(
+                chat_id=row["user_id"], message_id=row["telegram_message_id"]
+            )
+            deleted += 1
+        except Exception:
+            # Сообщение могло быть уже удалено пользователем вручную,
+            # либо Telegram не разрешает удалить слишком старое сообщение.
+            failed += 1
 
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM messages")
     conn.commit()
     conn.close()
+    clear_sent_messages()
 
-    await update.message.reply_text(
-        "🗑 Готово! Все сохранённые сообщения и файлы удалены из бота.\n"
-        "Пользователи больше не смогут их получить."
+    report = (
+        "🗑 Готово!\n"
+        "Все сохранённые сообщения и файлы удалены из бота.\n"
+        f"Удалено сообщений у пользователей: {deleted}"
     )
+    if failed:
+        report += f"\nНе удалось удалить: {failed} (возможно, слишком старые или уже удалены вручную)"
+
+    await update.message.reply_text(report)
 
 
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,20 +355,24 @@ async def admin_content_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def send_message_row(context, chat_id, row):
     msg_type = row["msg_type"]
+    sent = None
     if msg_type == "text":
-        await context.bot.send_message(chat_id=chat_id, text=row["text"])
+        sent = await context.bot.send_message(chat_id=chat_id, text=row["text"])
     elif msg_type == "document":
-        await context.bot.send_document(chat_id=chat_id, document=row["file_id"], caption=row["caption"])
+        sent = await context.bot.send_document(chat_id=chat_id, document=row["file_id"], caption=row["caption"])
     elif msg_type == "photo":
-        await context.bot.send_photo(chat_id=chat_id, photo=row["file_id"], caption=row["caption"])
+        sent = await context.bot.send_photo(chat_id=chat_id, photo=row["file_id"], caption=row["caption"])
     elif msg_type == "video":
-        await context.bot.send_video(chat_id=chat_id, video=row["file_id"], caption=row["caption"])
+        sent = await context.bot.send_video(chat_id=chat_id, video=row["file_id"], caption=row["caption"])
     elif msg_type == "audio":
-        await context.bot.send_audio(chat_id=chat_id, audio=row["file_id"], caption=row["caption"])
+        sent = await context.bot.send_audio(chat_id=chat_id, audio=row["file_id"], caption=row["caption"])
     elif msg_type == "voice":
-        await context.bot.send_voice(chat_id=chat_id, voice=row["file_id"], caption=row["caption"])
+        sent = await context.bot.send_voice(chat_id=chat_id, voice=row["file_id"], caption=row["caption"])
     elif msg_type == "animation":
-        await context.bot.send_animation(chat_id=chat_id, animation=row["file_id"], caption=row["caption"])
+        sent = await context.bot.send_animation(chat_id=chat_id, animation=row["file_id"], caption=row["caption"])
+
+    if sent is not None:
+        record_sent_message(chat_id, sent.message_id)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
