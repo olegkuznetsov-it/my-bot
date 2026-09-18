@@ -25,7 +25,14 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker_bot.db")
+# Путь к файлу базы данных. Если задана переменная окружения DB_PATH (например,
+# указывающая на подключённый Railway Volume — постоянное хранилище), используется
+# она. Иначе база хранится рядом с bot.py, но тогда она стирается при каждом
+# передеплое, если диск не подключён.
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker_bot.db"),
+)
 
 
 # ---------- Работа с базой данных ----------
