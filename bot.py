@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import sqlite3
@@ -326,6 +327,61 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text[i : i + 3500])
 
 
+async def force_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /force_clear [N] — доступна только админу.
+
+    Аварийный вариант удаления на случай, если список "кому что отправлено"
+    был утерян (например, база стёрлась при перезапуске сервера без
+    постоянного диска). Бот перебирает ID сообщений от 1 до N в каждом
+    известном приватном чате и пытается удалить каждое — как свои, так и
+    сообщения самого пользователя (Telegram разрешает боту удалять входящие
+    сообщения в приватных чатах). По сути это полная очистка переписки.
+
+    N по умолчанию 300, можно указать своё число, например: /force_clear 800
+    Чем больше N и больше пользователей — тем дольше будет работать команда.
+    """
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+
+    args = context.args
+    try:
+        limit = int(args[0]) if args else 300
+    except (ValueError, IndexError):
+        limit = 300
+    limit = max(1, min(limit, 3000))  # разумные границы, чтобы не зависнуть надолго
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    user_ids = [row["user_id"] for row in cur.fetchall()]
+    conn.close()
+
+    if not user_ids:
+        await update.message.reply_text("Нет ни одного известного пользователя в базе.")
+        return
+
+    await update.message.reply_text(
+        f"🧨 Запускаю аварийную очистку: попробую удалить ID сообщений 1..{limit} "
+        f"у {len(user_ids)} пользователей. Это может занять несколько минут, не прерывайте."
+    )
+
+    total_deleted = 0
+    for uid in user_ids:
+        for msg_id in range(1, limit + 1):
+            try:
+                ok = await context.bot.delete_message(chat_id=uid, message_id=msg_id)
+                if ok:
+                    total_deleted += 1
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)  # пауза, чтобы не словить ограничение Telegram на частоту запросов
+
+    await update.message.reply_text(
+        f"✅ Аварийная очистка завершена.\nВсего удалено сообщений (суммарно): {total_deleted}"
+    )
+
+
 async def admin_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ловит любой контент от админа и сохраняет его. Остальным подсказывает про кнопки."""
     user = update.effective_user
@@ -431,6 +487,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CommandHandler("users", list_users))
+    app.add_handler(CommandHandler("force_clear", force_clear))
     app.add_handler(CallbackQueryHandler(button_handler))
     # Ловим любой не-командный контент (текст, файлы, фото и т.д.)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, admin_content_handler))
