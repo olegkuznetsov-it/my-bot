@@ -351,14 +351,31 @@ async def force_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         limit = 300
     limit = max(1, min(limit, 3000))  # разумные границы, чтобы не зависнуть надолго
 
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users")
-    user_ids = [row["user_id"] for row in cur.fetchall()]
-    conn.close()
+    if len(args) >= 2:
+        # Второй аргумент — список ID пользователей через запятую, на случай
+        # если база пуста (например, после сброса) и взять их неоткуда.
+        # Пример: /force_clear 500 7191773240,2067551131,5599766419
+        try:
+            user_ids = [int(x.strip()) for x in args[1].split(",") if x.strip()]
+        except ValueError:
+            await update.message.reply_text(
+                "Не получилось разобрать список ID. Пример правильного формата:\n"
+                "/force_clear 500 7191773240,2067551131,5599766419"
+            )
+            return
+    else:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users")
+        user_ids = [row["user_id"] for row in cur.fetchall()]
+        conn.close()
 
     if not user_ids:
-        await update.message.reply_text("Нет ни одного известного пользователя в базе.")
+        await update.message.reply_text(
+            "Нет ни одного известного пользователя в базе.\n"
+            "Если знаете ID пользователей вручную, укажите их через запятую вторым аргументом:\n"
+            "/force_clear 500 7191773240,2067551131,5599766419"
+        )
         return
 
     await update.message.reply_text(
