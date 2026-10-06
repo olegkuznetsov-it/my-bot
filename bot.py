@@ -365,7 +365,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(user)
     touch_user(user.id, "last_start")
     if user.id in ADMIN_IDS:
-        await update.message.reply_text(ADMIN_HELP)
+        await say(context.bot, user.id, ADMIN_HELP, USER_KEYBOARD)
     else:
         await say(
             context.bot,
@@ -377,7 +377,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(update):
-        await update.message.reply_text(ADMIN_HELP)
+        await say(context.bot, update.effective_user.id, ADMIN_HELP, USER_KEYBOARD)
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,7 +479,6 @@ async def run_push(bot, report_chat_id):
         users = c.execute(
             "SELECT user_id, last_seen_id FROM users WHERE blocked = 0"
         ).fetchall()
-    users = [u for u in users if u["user_id"] not in ADMIN_IDS]
 
     reached = total = unreachable = 0
     for u in users:
