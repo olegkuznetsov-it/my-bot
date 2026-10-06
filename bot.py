@@ -2,15 +2,18 @@ import asyncio
 import logging
 import os
 import sqlite3
-from datetime import datetime
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -20,494 +23,632 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- Настройки ----------
-# Токен бота (получить у @BotFather) и список ID администраторов
-# берутся из переменных окружения, чтобы не хранить их в коде.
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+# =====================================================================
+# Настройки (задаются на Railway во вкладке Variables)
+# =====================================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 
-# Путь к файлу базы данных. Если задана переменная окружения DB_PATH (например,
-# указывающая на подключённый Railway Volume — постоянное хранилище), используется
-# она. Иначе база хранится рядом с bot.py, но тогда она стирается при каждом
-# передеплое, если диск не подключён.
-DB_PATH = os.environ.get(
-    "DB_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker_bot.db"),
-)
+# Если больше 0 — бот сам удаляет всё, что отправил пользователям, спустя
+# столько часов (максимум 46, потому что Telegram не даёт удалять
+# сообщения старше 48 часов). 0 = автоудаление выключено.
+AUTO_DELETE_HOURS = min(float(os.environ.get("AUTO_DELETE_HOURS", "0") or 0), 46)
+
+# Telegram разрешает боту удалять сообщения только младше 48 часов.
+# Берём запас в 1 час.
+SAFE_WINDOW = 47 * 3600
+
+# =====================================================================
+# Где хранится база данных
+# =====================================================================
+# Railway сам задаёт RAILWAY_VOLUME_MOUNT_PATH, когда к сервису подключён
+# Volume (постоянный диск). Тогда база лежит на нём и переживает любые
+# перезапуски и обновления кода.
+_volume = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+if _volume:
+    DB_PATH = os.path.join(_volume, "broker_bot.db")
+    PERSISTENT = True
+elif os.environ.get("DB_PATH"):
+    DB_PATH = os.environ["DB_PATH"]
+    PERSISTENT = True
+else:
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "broker_bot.db")
+    PERSISTENT = False  # данные будут стираться при каждом перезапуске!
+
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
 
 
-# ---------- Работа с базой данных ----------
-def get_conn():
+@contextmanager
+def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            msg_type TEXT NOT NULL,
-            text TEXT,
-            file_id TEXT,
-            caption TEXT,
-            created_at TEXT NOT NULL
+    with db() as c:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_type TEXT NOT NULL,
+                text TEXT,
+                file_id TEXT,
+                caption TEXT,
+                created_at REAL NOT NULL
+            )
+            """
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            last_seen_id INTEGER NOT NULL DEFAULT 0,
-            username TEXT
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                last_seen_id INTEGER NOT NULL DEFAULT 0,
+                first_seen REAL,
+                last_start REAL,
+                last_request REAL,
+                blocked INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
-        """
-    )
-    # Миграция: добавляем новые колонки, если их ещё нет — нужно для баз,
-    # созданных до появления отслеживания активности пользователей.
-    for column, col_type in [
-        ("full_name", "TEXT"),
-        ("first_seen", "TEXT"),
-        ("last_start", "TEXT"),
-        ("last_request", "TEXT"),
-    ]:
-        try:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {column} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # колонка уже существует — ничего делать не нужно
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sent_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            telegram_message_id INTEGER NOT NULL
+        # Журнал всего, что бот отправил пользователям: нужен, чтобы потом
+        # можно было удалить эти сообщения из чатов.
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                telegram_message_id INTEGER NOT NULL,
+                sent_at REAL NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sent_at ON sent_messages(sent_at)")
 
 
+# =====================================================================
+# Работа с данными
+# =====================================================================
 def save_message(msg_type, text=None, file_id=None, caption=None):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO messages (msg_type, text, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)",
-        (msg_type, text, file_id, caption, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with db() as c:
+        c.execute(
+            "INSERT INTO messages (msg_type, text, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)",
+            (msg_type, text, file_id, caption, time.time()),
+        )
 
 
-def register_user(user_id, username, full_name):
-    conn = get_conn()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, last_seen_id, username, full_name, first_seen) "
-        "VALUES (?, 0, ?, ?, ?)",
-        (user_id, username, full_name, now),
-    )
-    # если пользователь уже был в базе — обновляем его имя/username на случай изменений
-    cur.execute(
-        "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
-        (username, full_name, user_id),
-    )
-    conn.commit()
-    conn.close()
+def register_user(user):
+    with db() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?, ?)",
+            (user.id, time.time()),
+        )
+        c.execute(
+            "UPDATE users SET username = ?, full_name = ?, blocked = 0 WHERE user_id = ?",
+            (user.username or "", user.full_name or "", user.id),
+        )
 
 
-def touch_start(user_id):
-    """Отмечает момент, когда пользователь нажал /start."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET last_start = ? WHERE user_id = ?",
-        (datetime.utcnow().isoformat(), user_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def touch_request(user_id):
-    """Отмечает момент, когда пользователь запросил сообщения через кнопку."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET last_request = ? WHERE user_id = ?",
-        (datetime.utcnow().isoformat(), user_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_all_users():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users ORDER BY COALESCE(last_start, first_seen) DESC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def format_dt(iso_str):
-    if not iso_str:
-        return "ещё не было"
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%d.%m.%Y %H:%M UTC")
-    except ValueError:
-        return iso_str
+def touch_user(user_id, field):
+    assert field in ("last_start", "last_request")
+    with db() as c:
+        c.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (time.time(), user_id))
 
 
 def get_last_seen(user_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT last_seen_id FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
+    with db() as c:
+        row = c.execute("SELECT last_seen_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
     return row["last_seen_id"] if row else 0
 
 
 def set_last_seen(user_id, msg_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET last_seen_id = ? WHERE user_id = ?", (msg_id, user_id))
-    conn.commit()
-    conn.close()
+    with db() as c:
+        c.execute("UPDATE users SET last_seen_id = ? WHERE user_id = ?", (msg_id, user_id))
 
 
-def get_new_messages(after_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM messages WHERE id > ? ORDER BY id ASC", (after_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def mark_blocked(user_id):
+    with db() as c:
+        c.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
 
 
-def get_all_messages():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM messages ORDER BY id ASC")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def messages_after(after_id):
+    with db() as c:
+        return c.execute("SELECT * FROM messages WHERE id > ? ORDER BY id ASC", (after_id,)).fetchall()
 
 
-def record_sent_message(user_id, telegram_message_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO sent_messages (user_id, telegram_message_id) VALUES (?, ?)",
-        (user_id, telegram_message_id),
-    )
-    conn.commit()
-    conn.close()
+def record_sent(user_id, telegram_message_id):
+    with db() as c:
+        c.execute(
+            "INSERT INTO sent_messages (user_id, telegram_message_id, sent_at) VALUES (?, ?, ?)",
+            (user_id, telegram_message_id, time.time()),
+        )
 
 
-def get_all_sent_messages():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM sent_messages")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def fmt_dt(ts):
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
 
 
-def clear_sent_messages():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sent_messages")
-    conn.commit()
-    conn.close()
+def get_stats():
+    now = time.time()
+    with db() as c:
+        stored = c.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
+        users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
+        blocked = c.execute("SELECT COUNT(*) AS n FROM users WHERE blocked = 1").fetchone()["n"]
+        tracked = c.execute("SELECT COUNT(*) AS n FROM sent_messages").fetchone()["n"]
+        deletable = c.execute(
+            "SELECT COUNT(*) AS n FROM sent_messages WHERE sent_at > ?", (now - SAFE_WINDOW,)
+        ).fetchone()["n"]
+        chats = c.execute("SELECT COUNT(DISTINCT user_id) AS n FROM sent_messages").fetchone()["n"]
+    return {
+        "stored": stored,
+        "users": users,
+        "blocked": blocked,
+        "tracked": tracked,
+        "deletable": deletable,
+        "chats": chats,
+    }
 
 
-# ---------- Клавиатура ----------
-MAIN_KEYBOARD = InlineKeyboardMarkup(
+# =====================================================================
+# Отправка и удаление
+# =====================================================================
+BG_TASKS = set()
+
+
+def spawn(coro):
+    """Запускает долгую задачу в фоне, чтобы бот не переставал отвечать."""
+    task = asyncio.create_task(coro)
+    BG_TASKS.add(task)
+    task.add_done_callback(BG_TASKS.discard)
+
+
+async def send_row(bot, chat_id, row):
+    """Отправляет сохранённое сообщение пользователю и запоминает его ID."""
+    t = row["msg_type"]
+    if t == "text":
+        sent = await bot.send_message(chat_id=chat_id, text=row["text"])
+    elif t == "document":
+        sent = await bot.send_document(chat_id=chat_id, document=row["file_id"], caption=row["caption"])
+    elif t == "photo":
+        sent = await bot.send_photo(chat_id=chat_id, photo=row["file_id"], caption=row["caption"])
+    elif t == "video":
+        sent = await bot.send_video(chat_id=chat_id, video=row["file_id"], caption=row["caption"])
+    elif t == "audio":
+        sent = await bot.send_audio(chat_id=chat_id, audio=row["file_id"], caption=row["caption"])
+    elif t == "voice":
+        sent = await bot.send_voice(chat_id=chat_id, voice=row["file_id"], caption=row["caption"])
+    elif t == "animation":
+        sent = await bot.send_animation(chat_id=chat_id, animation=row["file_id"], caption=row["caption"])
+    else:
+        return None
+    record_sent(chat_id, sent.message_id)
+    return sent
+
+
+async def say(bot, chat_id, text, reply_markup=None):
+    """Отправляет служебное сообщение пользователю и тоже запоминает его."""
+    sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+    record_sent(chat_id, sent.message_id)
+    return sent
+
+
+async def deliver(bot, user_id, rows):
+    """Отправляет пользователю список сообщений. Возвращает (отправлено, доступен_ли_чат)."""
+    sent = 0
+    for row in rows:
+        for attempt in range(2):
+            try:
+                await send_row(bot, user_id, row)
+                sent += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+            except Forbidden:
+                mark_blocked(user_id)
+                return sent, False
+            except TelegramError as e:
+                logger.warning("Не удалось отправить %s пользователю %s: %s", row["id"], user_id, e)
+                break
+        await asyncio.sleep(0.05)
+    return sent, True
+
+
+async def try_delete(bot, chat_id, message_id):
+    for attempt in range(2):
+        try:
+            return await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramError:
+            return False
+    return False
+
+
+async def delete_tracked(bot, older_than_hours=None):
+    """Удаляет из чатов пользователей всё, что бот им отправил.
+
+    Возвращает (удалено, не_удалось, слишком_старые).
+    "Слишком старые" — те, что старше ~48 часов: Telegram не позволяет их удалить.
+    """
+    now = time.time()
+    with db() as c:
+        if older_than_hours is None:
+            rows = c.execute("SELECT * FROM sent_messages").fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM sent_messages WHERE sent_at <= ?",
+                (now - older_than_hours * 3600,),
+            ).fetchall()
+
+    deleted = failed = expired = 0
+    for r in rows:
+        if now - r["sent_at"] >= SAFE_WINDOW:
+            expired += 1
+        else:
+            if await try_delete(bot, r["user_id"], r["telegram_message_id"]):
+                deleted += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.05)
+
+    ids = [(r["id"],) for r in rows]
+    with db() as c:
+        c.executemany("DELETE FROM sent_messages WHERE id = ?", ids)
+    return deleted, failed, expired
+
+
+def format_delete_report(deleted, failed, expired):
+    text = f"Удалено из чатов пользователей: {deleted}"
+    if failed:
+        text += f"\nНе удалось (уже удалены вручную или чат недоступен): {failed}"
+    if expired:
+        text += (
+            f"\nНе удалить, т.к. прошло больше 48 часов (ограничение Telegram): {expired}"
+        )
+    return text
+
+
+# =====================================================================
+# Клавиатуры и тексты
+# =====================================================================
+USER_KEYBOARD = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("📥 Получить новые сообщения", callback_data="get_new")],
         [InlineKeyboardButton("📚 Получить все сообщения", callback_data="get_all")],
     ]
 )
 
-
-# ---------- Хендлеры ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_user(user.id, user.username or "", user.full_name)
-    touch_start(user.id)
-    is_admin = user.id in ADMIN_IDS
-
-    if is_admin:
-        text = (
-            "Привет! Вы администратор.\n\n"
-            "Просто отправляйте мне текст, документы, фото, видео, аудио или "
-            "голосовые — я сохраню их, и пользователи смогут забрать их по кнопке."
-        )
-        await update.message.reply_text(text)
-    else:
-        text = "Привет! Нажмите кнопку ниже, чтобы получить материалы от администратора."
-        await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+ADMIN_HELP = (
+    "Вы администратор. Просто отправляйте мне текст, документы, фото, видео, "
+    "аудио или голосовые — я сохраню их, и пользователи заберут их по кнопке.\n\n"
+    "Команды:\n"
+    "/push — сразу разослать всем пользователям то, что они ещё не получали\n"
+    "/wipe — удалить у ВСЕХ пользователей из чатов всё, что бот им присылал "
+    "(сохранённые файлы останутся в боте)\n"
+    "/clear — удалить сообщения из чатов пользователей И все сохранённые файлы\n"
+    "/users — список пользователей и их активность\n"
+    "/stats — статистика и состояние хранилища\n"
+    "/help — эта подсказка\n\n"
+    "⚠️ Telegram позволяет удалять сообщения только в течение 48 часов после "
+    "отправки. Более старые удалить невозможно."
+)
 
 
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /clear — доступна только админу.
-    Удаляет все сохранённые сообщения/файлы из базы бота, а также пытается
-    удалить их из чатов пользователей, которым они уже были отправлены.
-    """
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        return  # обычные пользователи не должны даже знать об этой команде
-
-    await update.message.reply_text("🧹 Начинаю очистку, это может занять немного времени...")
-
-    sent_rows = get_all_sent_messages()
-    deleted = 0
-    failed = 0
-    for row in sent_rows:
-        try:
-            await context.bot.delete_message(
-                chat_id=row["user_id"], message_id=row["telegram_message_id"]
-            )
-            deleted += 1
-        except Exception:
-            # Сообщение могло быть уже удалено пользователем вручную,
-            # либо Telegram не разрешает удалить слишком старое сообщение.
-            failed += 1
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM messages")
-    conn.commit()
-    conn.close()
-    clear_sent_messages()
-
-    report = (
-        "🗑 Готово!\n"
-        "Все сохранённые сообщения и файлы удалены из бота.\n"
-        f"Удалено сообщений у пользователей: {deleted}"
+def storage_line():
+    if PERSISTENT:
+        return "💾 Хранилище: постоянное (данные сохраняются)"
+    return (
+        "⚠️ Хранилище: ВРЕМЕННОЕ! Диск (Volume) не подключён — данные будут "
+        "стираться при каждом перезапуске. Подключите Volume на Railway."
     )
-    if failed:
-        report += f"\nНе удалось удалить: {failed} (возможно, слишком старые или уже удалены вручную)"
-
-    await update.message.reply_text(report)
 
 
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /users — доступна только админу. Показывает всех, кто пользовался ботом."""
+# =====================================================================
+# Команды
+# =====================================================================
+def is_admin(update: Update) -> bool:
+    return update.effective_user is not None and update.effective_user.id in ADMIN_IDS
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        return
+    register_user(user)
+    touch_user(user.id, "last_start")
+    if user.id in ADMIN_IDS:
+        await update.message.reply_text(ADMIN_HELP)
+    else:
+        await say(
+            context.bot,
+            user.id,
+            "Привет! Нажмите кнопку ниже, чтобы получить материалы от администратора.",
+            USER_KEYBOARD,
+        )
 
-    rows = get_all_users()
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        await update.message.reply_text(ADMIN_HELP)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    s = get_stats()
+    auto = f"каждые {AUTO_DELETE_HOURS:g} ч" if AUTO_DELETE_HOURS > 0 else "выключено"
+    await update.message.reply_text(
+        f"📊 Статистика\n\n"
+        f"Сохранено сообщений/файлов: {s['stored']}\n"
+        f"Пользователей: {s['users']} (заблокировали бота: {s['blocked']})\n"
+        f"Отправлено пользователям и отслеживается: {s['tracked']} в {s['chats']} чатах\n"
+        f"  из них ещё можно удалить (младше 48 ч): {s['deletable']}\n"
+        f"Автоудаление через N часов: {auto}\n\n"
+        f"{storage_line()}"
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM users ORDER BY COALESCE(last_request, last_start, first_seen) DESC"
+        ).fetchall()
     if not rows:
         await update.message.reply_text("Пока никто не заходил в бота.")
         return
 
-    blocks = [f"👥 Всего пользователей: {len(rows)}"]
-    for row in rows:
-        name = row["full_name"] or "Без имени"
-        username = f"@{row['username']}" if row["username"] else "без username"
+    blocks = []
+    for r in rows:
+        name = r["full_name"] or "Без имени"
+        uname = f"@{r['username']}" if r["username"] else "без username"
+        flag = " 🚫 заблокировал бота" if r["blocked"] else ""
         blocks.append(
-            f"• {name} ({username}, id: {row['user_id']})\n"
-            f"   Первый заход: {format_dt(row['first_seen'])}\n"
-            f"   Последний /start: {format_dt(row['last_start'])}\n"
-            f"   Последний запрос сообщений: {format_dt(row['last_request'])}"
+            f"• {name} ({uname}, id: {r['user_id']}){flag}\n"
+            f"   Первый заход: {fmt_dt(r['first_seen'])}\n"
+            f"   Последний /start: {fmt_dt(r['last_start'])}\n"
+            f"   Последний запрос сообщений: {fmt_dt(r['last_request'])}"
         )
 
-    text = "\n\n".join(blocks)
-    # Telegram ограничивает сообщение 4096 символами — при необходимости делим на части
-    for i in range(0, len(text), 3500):
-        await update.message.reply_text(text[i : i + 3500])
+    chunk = f"👥 Всего пользователей: {len(rows)}"
+    for block in blocks:
+        if len(chunk) + len(block) + 2 > 3500:
+            await update.message.reply_text(chunk)
+            chunk = block
+        else:
+            chunk += "\n\n" + block
+    await update.message.reply_text(chunk)
 
 
-async def force_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /force_clear [N] — доступна только админу.
+def confirm_keyboard(action):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"admin:{action}"),
+                InlineKeyboardButton("Отмена", callback_data="admin:cancel"),
+            ]
+        ]
+    )
 
-    Аварийный вариант удаления на случай, если список "кому что отправлено"
-    был утерян (например, база стёрлась при перезапуске сервера без
-    постоянного диска). Бот перебирает ID сообщений от 1 до N в каждом
-    известном приватном чате и пытается удалить каждое — как свои, так и
-    сообщения самого пользователя (Telegram разрешает боту удалять входящие
-    сообщения в приватных чатах). По сути это полная очистка переписки.
 
-    N по умолчанию 300, можно указать своё число, например: /force_clear 800
-    Чем больше N и больше пользователей — тем дольше будет работать команда.
-    """
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
+async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
         return
+    s = get_stats()
+    await update.message.reply_text(
+        f"Удалить из чатов ВСЕХ пользователей всё, что бот им присылал?\n\n"
+        f"Отслеживается сообщений: {s['tracked']} (в {s['chats']} чатах)\n"
+        f"Из них можно удалить (младше 48 ч): {s['deletable']}\n"
+        f"Остальные удалить невозможно — ограничение Telegram.\n\n"
+        f"Сохранённые файлы в боте останутся, пользователи смогут получить их снова.",
+        reply_markup=confirm_keyboard("wipe"),
+    )
 
-    args = context.args
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    s = get_stats()
+    await update.message.reply_text(
+        f"Удалить ВСЁ?\n\n"
+        f"1) Сообщения из чатов пользователей (можно удалить: {s['deletable']} из {s['tracked']})\n"
+        f"2) Все сохранённые в боте файлы и тексты ({s['stored']} шт.)\n\n"
+        f"Это необратимо.",
+        reply_markup=confirm_keyboard("clear"),
+    )
+
+
+async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text("📤 Начинаю рассылку в фоне. Пришлю отчёт, когда закончу.")
+    spawn(run_push(context.bot, update.effective_chat.id))
+
+
+async def run_push(bot, report_chat_id):
+    with db() as c:
+        users = c.execute(
+            "SELECT user_id, last_seen_id FROM users WHERE blocked = 0"
+        ).fetchall()
+    users = [u for u in users if u["user_id"] not in ADMIN_IDS]
+
+    reached = total = unreachable = 0
+    for u in users:
+        rows = messages_after(u["last_seen_id"])
+        if not rows:
+            continue
+        sent, ok = await deliver(bot, u["user_id"], rows)
+        total += sent
+        if ok:
+            reached += 1
+            set_last_seen(u["user_id"], rows[-1]["id"])
+        else:
+            unreachable += 1
+    text = f"✅ Рассылка завершена.\nПолучили новое: {reached} польз., отправлено сообщений: {total}"
+    if unreachable:
+        text += f"\nНедоступны (заблокировали бота): {unreachable}"
     try:
-        limit = int(args[0]) if args else 300
-    except (ValueError, IndexError):
-        limit = 300
-    limit = max(1, min(limit, 3000))  # разумные границы, чтобы не зависнуть надолго
+        await bot.send_message(chat_id=report_chat_id, text=text)
+    except TelegramError:
+        pass
 
-    if len(args) >= 2:
-        # Второй аргумент — список ID пользователей через запятую, на случай
-        # если база пуста (например, после сброса) и взять их неоткуда.
-        # Пример: /force_clear 500 7191773240,2067551131,5599766419
-        try:
-            user_ids = [int(x.strip()) for x in args[1].split(",") if x.strip()]
-        except ValueError:
-            await update.message.reply_text(
-                "Не получилось разобрать список ID. Пример правильного формата:\n"
-                "/force_clear 500 7191773240,2067551131,5599766419"
-            )
-            return
-    else:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users")
-        user_ids = [row["user_id"] for row in cur.fetchall()]
-        conn.close()
 
-    if not user_ids:
-        await update.message.reply_text(
-            "Нет ни одного известного пользователя в базе.\n"
-            "Если знаете ID пользователей вручную, укажите их через запятую вторым аргументом:\n"
-            "/force_clear 500 7191773240,2067551131,5599766419"
-        )
+async def run_wipe(bot, report_chat_id, clear_storage):
+    deleted, failed, expired = await delete_tracked(bot)
+    text = "🗑 Готово.\n" + format_delete_report(deleted, failed, expired)
+    if clear_storage:
+        with db() as c:
+            c.execute("DELETE FROM messages")
+            c.execute("UPDATE users SET last_seen_id = 0")
+        text += "\nСохранённые в боте файлы и тексты удалены."
+    try:
+        await bot.send_message(chat_id=report_chat_id, text=text)
+    except TelegramError:
+        pass
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Только для администратора", show_alert=True)
         return
-
-    await update.message.reply_text(
-        f"🧨 Запускаю аварийную очистку: попробую удалить ID сообщений 1..{limit} "
-        f"у {len(user_ids)} пользователей. Это может занять несколько минут, не прерывайте."
-    )
-
-    total_deleted = 0
-    for uid in user_ids:
-        for msg_id in range(1, limit + 1):
-            try:
-                ok = await context.bot.delete_message(chat_id=uid, message_id=msg_id)
-                if ok:
-                    total_deleted += 1
-            except Exception:
-                pass
-            await asyncio.sleep(0.05)  # пауза, чтобы не словить ограничение Telegram на частоту запросов
-
-    await update.message.reply_text(
-        f"✅ Аварийная очистка завершена.\nВсего удалено сообщений (суммарно): {total_deleted}"
-    )
-
-
-async def admin_content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит любой контент от админа и сохраняет его. Остальным подсказывает про кнопки."""
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text(
-            "Отправка контента доступна только администратору.\n"
-            "Используйте кнопки ниже, чтобы получить сообщения:",
-            reply_markup=MAIN_KEYBOARD,
-        )
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    if action == "cancel":
+        await query.edit_message_text("Отменено.")
         return
-
-    msg = update.message
-
-    if msg.text:
-        save_message("text", text=msg.text)
-    elif msg.document:
-        save_message("document", file_id=msg.document.file_id, caption=msg.caption)
-    elif msg.photo:
-        save_message("photo", file_id=msg.photo[-1].file_id, caption=msg.caption)
-    elif msg.video:
-        save_message("video", file_id=msg.video.file_id, caption=msg.caption)
-    elif msg.audio:
-        save_message("audio", file_id=msg.audio.file_id, caption=msg.caption)
-    elif msg.voice:
-        save_message("voice", file_id=msg.voice.file_id, caption=msg.caption)
-    elif msg.animation:
-        save_message("animation", file_id=msg.animation.file_id, caption=msg.caption)
-    else:
-        await msg.reply_text("Этот тип контента пока не поддерживается ботом.")
-        return
-
-    await msg.reply_text("✅ Сохранено. Теперь это доступно пользователям через кнопку.")
+    if action in ("wipe", "clear"):
+        await query.edit_message_text("⏳ Удаляю в фоне. Пришлю отчёт, когда закончу.")
+        spawn(run_wipe(context.bot, query.message.chat_id, clear_storage=(action == "clear")))
 
 
-async def send_message_row(context, chat_id, row):
-    msg_type = row["msg_type"]
-    sent = None
-    if msg_type == "text":
-        sent = await context.bot.send_message(chat_id=chat_id, text=row["text"])
-    elif msg_type == "document":
-        sent = await context.bot.send_document(chat_id=chat_id, document=row["file_id"], caption=row["caption"])
-    elif msg_type == "photo":
-        sent = await context.bot.send_photo(chat_id=chat_id, photo=row["file_id"], caption=row["caption"])
-    elif msg_type == "video":
-        sent = await context.bot.send_video(chat_id=chat_id, video=row["file_id"], caption=row["caption"])
-    elif msg_type == "audio":
-        sent = await context.bot.send_audio(chat_id=chat_id, audio=row["file_id"], caption=row["caption"])
-    elif msg_type == "voice":
-        sent = await context.bot.send_voice(chat_id=chat_id, voice=row["file_id"], caption=row["caption"])
-    elif msg_type == "animation":
-        sent = await context.bot.send_animation(chat_id=chat_id, animation=row["file_id"], caption=row["caption"])
-
-    if sent is not None:
-        record_sent_message(chat_id, sent.message_id)
-
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =====================================================================
+# Пользовательские кнопки
+# =====================================================================
+async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    register_user(user.id, user.username or "", user.full_name)
-    touch_request(user.id)
+    register_user(user)
+    touch_user(user.id, "last_request")
 
     if query.data == "get_new":
-        last_seen = get_last_seen(user.id)
-        rows = get_new_messages(last_seen)
-        if not rows:
-            await query.message.reply_text("Новых сообщений нет.", reply_markup=MAIN_KEYBOARD)
-            return
-        for row in rows:
-            await send_message_row(context, user.id, row)
-        set_last_seen(user.id, rows[-1]["id"])
-        await query.message.reply_text(
-            f"Готово! Отправлено сообщений: {len(rows)}", reply_markup=MAIN_KEYBOARD
-        )
+        rows = messages_after(get_last_seen(user.id))
+        empty_text = "Новых сообщений нет."
+    else:
+        rows = messages_after(0)
+        empty_text = "Сообщений пока нет."
 
-    elif query.data == "get_all":
-        rows = get_all_messages()
-        if not rows:
-            await query.message.reply_text("Сообщений пока нет.", reply_markup=MAIN_KEYBOARD)
-            return
-        for row in rows:
-            await send_message_row(context, user.id, row)
+    if not rows:
+        await say(context.bot, user.id, empty_text, USER_KEYBOARD)
+        return
+
+    sent, ok = await deliver(context.bot, user.id, rows)
+    if ok:
         set_last_seen(user.id, rows[-1]["id"])
-        await query.message.reply_text(
-            f"Готово! Отправлено сообщений: {len(rows)}", reply_markup=MAIN_KEYBOARD
+        await say(context.bot, user.id, f"Готово! Отправлено сообщений: {sent}", USER_KEYBOARD)
+
+
+# =====================================================================
+# Приём контента от администратора
+# =====================================================================
+async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        register_user(user)
+        await say(
+            context.bot,
+            user.id,
+            "Отправка контента доступна только администратору.\n"
+            "Используйте кнопки ниже, чтобы получить сообщения:",
+            USER_KEYBOARD,
         )
+        return
+
+    m = update.message
+    if m.text:
+        save_message("text", text=m.text)
+    elif m.document:
+        save_message("document", file_id=m.document.file_id, caption=m.caption)
+    elif m.photo:
+        save_message("photo", file_id=m.photo[-1].file_id, caption=m.caption)
+    elif m.video:
+        save_message("video", file_id=m.video.file_id, caption=m.caption)
+    elif m.audio:
+        save_message("audio", file_id=m.audio.file_id, caption=m.caption)
+    elif m.voice:
+        save_message("voice", file_id=m.voice.file_id, caption=m.caption)
+    elif m.animation:
+        save_message("animation", file_id=m.animation.file_id, caption=m.caption)
+    else:
+        await m.reply_text("Этот тип контента пока не поддерживается ботом.")
+        return
+
+    await m.reply_text("✅ Сохранено. Пользователи получат это по кнопке (или сразу — по команде /push).")
+
+
+# =====================================================================
+# Фоновые задачи и запуск
+# =====================================================================
+async def auto_cleanup(context: ContextTypes.DEFAULT_TYPE):
+    if AUTO_DELETE_HOURS <= 0:
+        return
+    deleted, failed, expired = await delete_tracked(context.bot, older_than_hours=AUTO_DELETE_HOURS)
+    if deleted or failed or expired:
+        logger.info("Автоудаление: удалено=%s, не удалось=%s, устарело=%s", deleted, failed, expired)
+
+
+async def on_startup(app: Application):
+    s = get_stats()
+    text = (
+        "🤖 Бот запущен.\n"
+        f"В базе: сообщений {s['stored']}, пользователей {s['users']}.\n"
+        f"{storage_line()}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.bot.send_message(chat_id=admin_id, text=text)
+        except TelegramError as e:
+            logger.warning("Не удалось уведомить админа %s: %s", admin_id, e)
 
 
 def main():
-    init_db()
-    if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
-        raise RuntimeError(
-            "Не задан токен бота. Установите переменную окружения BOT_TOKEN."
-        )
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан токен бота. Добавьте переменную BOT_TOKEN.")
     if not ADMIN_IDS:
-        logger.warning(
-            "Переменная ADMIN_IDS пуста — никто не сможет отправлять контент как администратор."
-        )
+        logger.warning("ADMIN_IDS пуст — никто не сможет отправлять контент.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    init_db()
+    logger.info("База данных: %s (постоянная: %s)", DB_PATH, PERSISTENT)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clear", clear_history))
-    app.add_handler(CommandHandler("users", list_users))
-    app.add_handler(CommandHandler("force_clear", force_clear))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    # Ловим любой не-командный контент (текст, файлы, фото и т.д.)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, admin_content_handler))
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("wipe", cmd_wipe))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("push", cmd_push))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern=r"^admin:"))
+    app.add_handler(CallbackQueryHandler(user_callback, pattern=r"^get_(new|all)$"))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, content_handler))
+
+    if AUTO_DELETE_HOURS > 0:
+        if app.job_queue is None:
+            logger.warning("JobQueue недоступен — автоудаление не будет работать.")
+        else:
+            app.job_queue.run_repeating(auto_cleanup, interval=900, first=60)
+            logger.info("Автоудаление включено: старше %s ч", AUTO_DELETE_HOURS)
 
     logger.info("Bot started")
     app.run_polling()
