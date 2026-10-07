@@ -34,6 +34,11 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 # сообщения старше 48 часов). 0 = автоудаление выключено.
 AUTO_DELETE_HOURS = min(float(os.environ.get("AUTO_DELETE_HOURS", "0") or 0), 46)
 
+# Плановая ПОЛНАЯ очистка: раз в N часов бот удаляет у всех пользователей
+# из чатов всё, что присылал, И стирает все сохранённые файлы и тексты.
+# 0 = выключено. Максимум 46 (иначе сообщения станет нельзя удалить).
+FULL_CLEAR_HOURS = min(float(os.environ.get("FULL_CLEAR_HOURS", "0") or 0), 46)
+
 # Telegram разрешает боту удалять сообщения только младше 48 часов.
 # Берём запас в 1 час.
 SAFE_WINDOW = 47 * 3600
@@ -117,6 +122,7 @@ def init_db():
             """
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_sent_at ON sent_messages(sent_at)")
+        c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
 
 
 # =====================================================================
@@ -191,6 +197,21 @@ def record_sent(user_id, telegram_message_id):
         c.execute(
             "INSERT INTO sent_messages (user_id, telegram_message_id, sent_at) VALUES (?, ?, ?)",
             (user_id, telegram_message_id, time.time()),
+        )
+
+
+def get_setting(key):
+    with db() as c:
+        row = c.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(key, value):
+    with db() as c:
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
         )
 
 
@@ -375,6 +396,17 @@ ADMIN_HELP = (
 )
 
 
+def schedule_line():
+    if FULL_CLEAR_HOURS <= 0:
+        return "Плановая полная очистка: выключена"
+    last = get_setting("last_full_clear")
+    nxt = (float(last) if last else time.time()) + FULL_CLEAR_HOURS * 3600
+    return (
+        f"🧹 Плановая полная очистка: каждые {FULL_CLEAR_HOURS:g} ч, "
+        f"следующая около {fmt_dt(nxt)}"
+    )
+
+
 BANNED_TEXT = "⛔ Доступ к боту закрыт администратором."
 
 
@@ -428,7 +460,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пользователей: {s['users']} (заблокировали бота: {s['blocked']}, закрыт доступ: {s['banned']})\n"
         f"Отправлено пользователям и отслеживается: {s['tracked']} в {s['chats']} чатах\n"
         f"  из них ещё можно удалить (младше 48 ч): {s['deletable']}\n"
-        f"Автоудаление через N часов: {auto}\n\n"
+        f"Автоудаление через N часов: {auto}\n"
+        f"{schedule_line()}\n\n"
         f"{storage_line()}"
     )
 
@@ -631,6 +664,7 @@ async def run_wipe(bot, report_chat_id, clear_storage):
         with db() as c:
             c.execute("DELETE FROM messages")
             c.execute("UPDATE users SET last_seen_id = 0")
+        set_setting("last_full_clear", time.time())
         text += "\nСохранённые в боте файлы и тексты удалены."
     try:
         await bot.send_message(chat_id=report_chat_id, text=text)
@@ -735,11 +769,49 @@ async def auto_cleanup(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Автоудаление: удалено=%s, не удалось=%s, устарело=%s", deleted, failed, expired)
 
 
+FULL_CLEAR_RUNNING = False
+
+
+async def scheduled_full_clear(context: ContextTypes.DEFAULT_TYPE):
+    """Раз в FULL_CLEAR_HOURS часов: удалить всё из чатов и стереть все файлы бота."""
+    global FULL_CLEAR_RUNNING
+    if FULL_CLEAR_HOURS <= 0 or FULL_CLEAR_RUNNING:
+        return
+    last = get_setting("last_full_clear")
+    if last is None:
+        set_setting("last_full_clear", time.time())
+        return
+    if time.time() - float(last) < FULL_CLEAR_HOURS * 3600:
+        return
+
+    FULL_CLEAR_RUNNING = True
+    try:
+        deleted, failed, expired = await delete_tracked(context.bot)
+        with db() as c:
+            c.execute("DELETE FROM messages")
+            c.execute("UPDATE users SET last_seen_id = 0")
+        set_setting("last_full_clear", time.time())
+        text = (
+            f"🧹 Плановая полная очистка выполнена (каждые {FULL_CLEAR_HOURS:g} ч).\n"
+            + format_delete_report(deleted, failed, expired)
+            + "\nСохранённые в боте файлы и тексты удалены. Загрузите материалы заново."
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=text)
+            except TelegramError:
+                pass
+        logger.info("Плановая очистка: удалено=%s, не удалось=%s, устарело=%s", deleted, failed, expired)
+    finally:
+        FULL_CLEAR_RUNNING = False
+
+
 async def on_startup(app: Application):
     s = get_stats()
     text = (
         "🤖 Бот запущен.\n"
         f"В базе: сообщений {s['stored']}, пользователей {s['users']}.\n"
+        f"{schedule_line()}\n"
         f"{storage_line()}"
     )
     for admin_id in ADMIN_IDS:
@@ -756,6 +828,8 @@ def main():
         logger.warning("ADMIN_IDS пуст — никто не сможет отправлять контент.")
 
     init_db()
+    if FULL_CLEAR_HOURS > 0 and get_setting("last_full_clear") is None:
+        set_setting("last_full_clear", time.time())  # отсчёт начинается с первого запуска
     logger.info("База данных: %s (постоянная: %s)", DB_PATH, PERSISTENT)
 
     app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
@@ -780,6 +854,13 @@ def main():
         else:
             app.job_queue.run_repeating(auto_cleanup, interval=900, first=60)
             logger.info("Автоудаление включено: старше %s ч", AUTO_DELETE_HOURS)
+
+    if FULL_CLEAR_HOURS > 0:
+        if app.job_queue is None:
+            logger.warning("JobQueue недоступен — плановая очистка не будет работать.")
+        else:
+            app.job_queue.run_repeating(scheduled_full_clear, interval=600, first=120)
+            logger.info("Плановая полная очистка включена: каждые %s ч", FULL_CLEAR_HOURS)
 
     logger.info("Bot started")
     app.run_polling()
