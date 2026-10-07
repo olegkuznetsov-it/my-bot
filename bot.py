@@ -5,6 +5,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import Forbidden, RetryAfter, TelegramError
@@ -38,6 +39,16 @@ AUTO_DELETE_HOURS = min(float(os.environ.get("AUTO_DELETE_HOURS", "0") or 0), 46
 # из чатов всё, что присылал, И стирает все сохранённые файлы и тексты.
 # 0 = выключено. Максимум 46 (иначе сообщения станет нельзя удалить).
 FULL_CLEAR_HOURS = min(float(os.environ.get("FULL_CLEAR_HOURS", "0") or 0), 46)
+
+# Часовой пояс для отображения дат админу (/users, /stats и т.д.).
+# По умолчанию Казахстан (UTC+5). Можно поменять переменной TIMEZONE,
+# например Europe/Moscow или Asia/Tashkent.
+TIMEZONE = os.environ.get("TIMEZONE", "Asia/Almaty")
+try:
+    TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    logger.warning("Неизвестный часовой пояс %r — используется UTC", TIMEZONE)
+    TZ = timezone.utc
 
 # Telegram разрешает боту удалять сообщения только младше 48 часов.
 # Берём запас в 1 час.
@@ -218,7 +229,9 @@ def set_setting(key, value):
 def fmt_dt(ts):
     if not ts:
         return "—"
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+    dt = datetime.fromtimestamp(ts, tz=TZ)
+    hours = dt.utcoffset().total_seconds() / 3600
+    return dt.strftime("%d.%m.%Y %H:%M") + f" (UTC{hours:+g})"
 
 
 def get_stats():
