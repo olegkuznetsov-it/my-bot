@@ -95,10 +95,15 @@ def init_db():
                 first_seen REAL,
                 last_start REAL,
                 last_request REAL,
-                blocked INTEGER NOT NULL DEFAULT 0
+                blocked INTEGER NOT NULL DEFAULT 0,
+                banned INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        try:  # для баз, созданных до появления блокировки пользователей
+            c.execute("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         # Журнал всего, что бот отправил пользователям: нужен, чтобы потом
         # можно было удалить эти сообщения из чатов.
         c.execute(
@@ -154,6 +159,23 @@ def set_last_seen(user_id, msg_id):
         c.execute("UPDATE users SET last_seen_id = ? WHERE user_id = ?", (msg_id, user_id))
 
 
+def is_banned(user_id):
+    with db() as c:
+        row = c.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row["banned"])
+
+
+def set_banned(user_id, flag):
+    with db() as c:
+        if flag:
+            # запись создаём, даже если человек ещё ни разу не заходил в бота
+            c.execute(
+                "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?, ?)",
+                (user_id, time.time()),
+            )
+        c.execute("UPDATE users SET banned = ? WHERE user_id = ?", (1 if flag else 0, user_id))
+
+
 def mark_blocked(user_id):
     with db() as c:
         c.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
@@ -184,6 +206,7 @@ def get_stats():
         stored = c.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
         users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         blocked = c.execute("SELECT COUNT(*) AS n FROM users WHERE blocked = 1").fetchone()["n"]
+        banned = c.execute("SELECT COUNT(*) AS n FROM users WHERE banned = 1").fetchone()["n"]
         tracked = c.execute("SELECT COUNT(*) AS n FROM sent_messages").fetchone()["n"]
         deletable = c.execute(
             "SELECT COUNT(*) AS n FROM sent_messages WHERE sent_at > ?", (now - SAFE_WINDOW,)
@@ -193,6 +216,7 @@ def get_stats():
         "stored": stored,
         "users": users,
         "blocked": blocked,
+        "banned": banned,
         "tracked": tracked,
         "deletable": deletable,
         "chats": chats,
@@ -274,21 +298,24 @@ async def try_delete(bot, chat_id, message_id):
     return False
 
 
-async def delete_tracked(bot, older_than_hours=None):
+async def delete_tracked(bot, older_than_hours=None, user_id=None):
     """Удаляет из чатов пользователей всё, что бот им отправил.
 
     Возвращает (удалено, не_удалось, слишком_старые).
     "Слишком старые" — те, что старше ~48 часов: Telegram не позволяет их удалить.
     """
     now = time.time()
+    query, conds, params = "SELECT * FROM sent_messages", [], []
+    if older_than_hours is not None:
+        conds.append("sent_at <= ?")
+        params.append(now - older_than_hours * 3600)
+    if user_id is not None:
+        conds.append("user_id = ?")
+        params.append(user_id)
+    if conds:
+        query += " WHERE " + " AND ".join(conds)
     with db() as c:
-        if older_than_hours is None:
-            rows = c.execute("SELECT * FROM sent_messages").fetchall()
-        else:
-            rows = c.execute(
-                "SELECT * FROM sent_messages WHERE sent_at <= ?",
-                (now - older_than_hours * 3600,),
-            ).fetchall()
+        rows = c.execute(query, params).fetchall()
 
     deleted = failed = expired = 0
     for r in rows:
@@ -337,11 +364,18 @@ ADMIN_HELP = (
     "(сохранённые файлы останутся в боте)\n"
     "/clear — удалить сообщения из чатов пользователей И все сохранённые файлы\n"
     "/users — список пользователей и их активность\n"
+    "/ban ID — закрыть пользователю доступ и удалить у него сообщения бота "
+    "(можно несколько ID через пробел)\n"
+    "/unban ID — вернуть доступ\n"
+    "/banned — список заблокированных\n"
     "/stats — статистика и состояние хранилища\n"
     "/help — эта подсказка\n\n"
     "⚠️ Telegram позволяет удалять сообщения только в течение 48 часов после "
     "отправки. Более старые удалить невозможно."
 )
+
+
+BANNED_TEXT = "⛔ Доступ к боту закрыт администратором."
 
 
 def storage_line():
@@ -362,6 +396,9 @@ def is_admin(update: Update) -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if user.id not in ADMIN_IDS and is_banned(user.id):
+        await update.message.reply_text(BANNED_TEXT)
+        return
     register_user(user)
     touch_user(user.id, "last_start")
     if user.id in ADMIN_IDS:
@@ -388,7 +425,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 Статистика\n\n"
         f"Сохранено сообщений/файлов: {s['stored']}\n"
-        f"Пользователей: {s['users']} (заблокировали бота: {s['blocked']})\n"
+        f"Пользователей: {s['users']} (заблокировали бота: {s['blocked']}, закрыт доступ: {s['banned']})\n"
         f"Отправлено пользователям и отслеживается: {s['tracked']} в {s['chats']} чатах\n"
         f"  из них ещё можно удалить (младше 48 ч): {s['deletable']}\n"
         f"Автоудаление через N часов: {auto}\n\n"
@@ -411,7 +448,11 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         name = r["full_name"] or "Без имени"
         uname = f"@{r['username']}" if r["username"] else "без username"
-        flag = " 🚫 заблокировал бота" if r["blocked"] else ""
+        flag = ""
+        if r["banned"]:
+            flag = " ⛔ ДОСТУП ЗАКРЫТ"
+        elif r["blocked"]:
+            flag = " 🚫 заблокировал бота"
         blocks.append(
             f"• {name} ({uname}, id: {r['user_id']}){flag}\n"
             f"   Первый заход: {fmt_dt(r['first_seen'])}\n"
@@ -427,6 +468,88 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             chunk += "\n\n" + block
     await update.message.reply_text(chunk)
+
+
+def parse_ids(args):
+    ids, bad = [], []
+    for a in args:
+        for part in a.replace(",", " ").split():
+            try:
+                ids.append(int(part))
+            except ValueError:
+                bad.append(part)
+    return list(dict.fromkeys(ids)), bad
+
+
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    ids, bad = parse_ids(context.args)
+    if not ids:
+        await update.message.reply_text(
+            "Укажите ID пользователя:\n/ban 123456789\n"
+            "Или сразу нескольких: /ban 111 222 333\n"
+            "ID можно посмотреть в команде /users."
+        )
+        return
+    skipped = [i for i in ids if i in ADMIN_IDS]
+    ids = [i for i in ids if i not in ADMIN_IDS]
+    notes = ""
+    if skipped:
+        notes += "\nАдминистраторов блокировать нельзя, пропущены: " + ", ".join(map(str, skipped))
+    if bad:
+        notes += "\nНе похоже на ID, пропущено: " + ", ".join(bad)
+    if not ids:
+        await update.message.reply_text("Некого блокировать." + notes)
+        return
+    for uid in ids:
+        set_banned(uid, True)  # доступ закрывается сразу
+    await update.message.reply_text(
+        f"⛔ Доступ закрыт: {len(ids)}. Удаляю их сообщения в фоне, пришлю отчёт." + notes
+    )
+    spawn(run_ban(context.bot, update.effective_chat.id, ids))
+
+
+async def run_ban(bot, report_chat_id, ids):
+    deleted = failed = expired = 0
+    for uid in ids:
+        d, f, e = await delete_tracked(bot, user_id=uid)
+        deleted, failed, expired = deleted + d, failed + f, expired + e
+    text = f"⛔ Заблокировано пользователей: {len(ids)}\n" + format_delete_report(deleted, failed, expired)
+    try:
+        await bot.send_message(chat_id=report_chat_id, text=text)
+    except TelegramError:
+        pass
+
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    ids, bad = parse_ids(context.args)
+    if not ids:
+        await update.message.reply_text("Укажите ID: /unban 123456789")
+        return
+    for uid in ids:
+        set_banned(uid, False)
+    text = f"✅ Доступ возвращён: {len(ids)}"
+    if bad:
+        text += "\nНе похоже на ID, пропущено: " + ", ".join(bad)
+    await update.message.reply_text(text)
+
+
+async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    with db() as c:
+        rows = c.execute("SELECT * FROM users WHERE banned = 1").fetchall()
+    if not rows:
+        await update.message.reply_text("Заблокированных пользователей нет.")
+        return
+    lines = [f"⛔ Заблокировано: {len(rows)}"]
+    for r in rows:
+        uname = f"@{r['username']}" if r["username"] else "без username"
+        lines.append(f"• {r['full_name'] or 'Без имени'} ({uname}, id: {r['user_id']})")
+    await update.message.reply_text("\n".join(lines) + "\n\nВернуть доступ: /unban ID")
 
 
 def confirm_keyboard(action):
@@ -477,7 +600,7 @@ async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_push(bot, report_chat_id):
     with db() as c:
         users = c.execute(
-            "SELECT user_id, last_seen_id FROM users WHERE blocked = 0"
+            "SELECT user_id, last_seen_id FROM users WHERE blocked = 0 AND banned = 0"
         ).fetchall()
 
     reached = total = unreachable = 0
@@ -535,8 +658,11 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =====================================================================
 async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user = query.from_user
+    if user.id not in ADMIN_IDS and is_banned(user.id):
+        await query.answer(BANNED_TEXT, show_alert=True)
+        return
+    await query.answer()
     register_user(user)
     touch_user(user.id, "last_request")
 
@@ -563,6 +689,9 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
+        if is_banned(user.id):
+            await update.message.reply_text(BANNED_TEXT)
+            return
         register_user(user)
         await say(
             context.bot,
@@ -635,6 +764,9 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("banned", cmd_banned))
     app.add_handler(CommandHandler("wipe", cmd_wipe))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("push", cmd_push))
