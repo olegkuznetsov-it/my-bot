@@ -112,12 +112,23 @@ def init_db():
                 last_start REAL,
                 last_request REAL,
                 blocked INTEGER NOT NULL DEFAULT 0,
-                banned INTEGER NOT NULL DEFAULT 0
+                banned INTEGER NOT NULL DEFAULT 0,
+                approved INTEGER NOT NULL DEFAULT 0,
+                requested_at REAL
             )
             """
         )
         try:  # для баз, созданных до появления блокировки пользователей
             c.execute("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:  # режим «доступ по приглашению»: все прежние пользователи сохраняют доступ
+            c.execute("ALTER TABLE users ADD COLUMN approved INTEGER NOT NULL DEFAULT 0")
+            c.execute("UPDATE users SET approved = 1 WHERE banned = 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN requested_at REAL")
         except sqlite3.OperationalError:
             pass
         # Журнал всего, что бот отправил пользователям: нужен, чтобы потом
@@ -157,6 +168,8 @@ def register_user(user):
             "UPDATE users SET username = ?, full_name = ?, blocked = 0 WHERE user_id = ?",
             (user.username or "", user.full_name or "", user.id),
         )
+        if user.id in ADMIN_IDS:
+            c.execute("UPDATE users SET approved = 1 WHERE user_id = ?", (user.id,))
 
 
 def touch_user(user_id, field):
@@ -191,6 +204,36 @@ def set_banned(user_id, flag):
                 (user_id, time.time()),
             )
         c.execute("UPDATE users SET banned = ? WHERE user_id = ?", (1 if flag else 0, user_id))
+
+
+def is_approved(user_id):
+    with db() as c:
+        row = c.execute("SELECT approved FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row["approved"])
+
+
+def set_approved(user_id, flag):
+    with db() as c:
+        if flag:
+            # запись создаём, даже если человек ещё ни разу не заходил;
+            # /allow заодно снимает блокировку
+            c.execute(
+                "INSERT OR IGNORE INTO users (user_id, first_seen) VALUES (?, ?)",
+                (user_id, time.time()),
+            )
+            c.execute("UPDATE users SET approved = 1, banned = 0 WHERE user_id = ?", (user_id,))
+        else:
+            c.execute("UPDATE users SET approved = 0 WHERE user_id = ?", (user_id,))
+
+
+def mark_requested(user_id):
+    with db() as c:
+        c.execute("UPDATE users SET requested_at = ? WHERE user_id = ?", (time.time(), user_id))
+
+
+def clear_request(user_id):
+    with db() as c:
+        c.execute("UPDATE users SET requested_at = NULL WHERE user_id = ?", (user_id,))
 
 
 def mark_blocked(user_id):
@@ -241,6 +284,9 @@ def get_stats():
         users = c.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         blocked = c.execute("SELECT COUNT(*) AS n FROM users WHERE blocked = 1").fetchone()["n"]
         banned = c.execute("SELECT COUNT(*) AS n FROM users WHERE banned = 1").fetchone()["n"]
+        pending = c.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE approved = 0 AND banned = 0"
+        ).fetchone()["n"]
         tracked = c.execute("SELECT COUNT(*) AS n FROM sent_messages").fetchone()["n"]
         deletable = c.execute(
             "SELECT COUNT(*) AS n FROM sent_messages WHERE sent_at > ?", (now - SAFE_WINDOW,)
@@ -251,6 +297,7 @@ def get_stats():
         "users": users,
         "blocked": blocked,
         "banned": banned,
+        "pending": pending,
         "tracked": tracked,
         "deletable": deletable,
         "chats": chats,
@@ -402,6 +449,8 @@ ADMIN_HELP = (
     "(можно несколько ID через пробел)\n"
     "/unban ID — вернуть доступ\n"
     "/banned — список заблокированных\n"
+    "/allow ID — впустить человека по ID (бот работает только по приглашению)\n"
+    "/pending — кто ждёт одобрения\n"
     "/stats — статистика и состояние хранилища\n"
     "/help — эта подсказка\n\n"
     "⚠️ Telegram позволяет удалять сообщения только в течение 48 часов после "
@@ -421,6 +470,8 @@ def schedule_line():
 
 
 BANNED_TEXT = "⛔ Доступ к боту закрыт администратором."
+PENDING_TEXT = "🔒 Доступ к боту только по приглашению. Запрос отправлен администратору — ожидайте решения."
+PENDING_AGAIN_TEXT = "🔒 Ваш запрос уже отправлен администратору. Ожидайте решения."
 
 
 def storage_line():
@@ -441,8 +492,7 @@ def is_admin(update: Update) -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id not in ADMIN_IDS and is_banned(user.id):
-        await update.message.reply_text(BANNED_TEXT)
+    if not await gate(update, context):
         return
     register_user(user)
     touch_user(user.id, "last_start")
@@ -470,7 +520,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📊 Статистика\n\n"
         f"Сохранено сообщений/файлов: {s['stored']}\n"
-        f"Пользователей: {s['users']} (заблокировали бота: {s['blocked']}, закрыт доступ: {s['banned']})\n"
+        f"Пользователей: {s['users']} (заблокировали бота: {s['blocked']}, закрыт доступ: {s['banned']}, ждут одобрения: {s['pending']})\n"
         f"Отправлено пользователям и отслеживается: {s['tracked']} в {s['chats']} чатах\n"
         f"  из них ещё можно удалить (младше 48 ч): {s['deletable']}\n"
         f"Автоудаление через N часов: {auto}\n"
@@ -497,6 +547,8 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flag = ""
         if r["banned"]:
             flag = " ⛔ ДОСТУП ЗАКРЫТ"
+        elif not r["approved"]:
+            flag = " ⏳ ждёт одобрения"
         elif r["blocked"]:
             flag = " 🚫 заблокировал бота"
         blocks.append(
@@ -577,7 +629,12 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     for uid in ids:
         set_banned(uid, False)
-    text = f"✅ Доступ возвращён: {len(ids)}"
+        clear_request(uid)
+    text = (
+        f"✅ Блокировка снята: {len(ids)}.\n"
+        "Если человек был одобрен раньше, доступ вернулся. Если нет — ему нужно снова "
+        "нажать /start, либо впустите его сразу командой /allow ID."
+    )
     if bad:
         text += "\nНе похоже на ID, пропущено: " + ", ".join(bad)
     await update.message.reply_text(text)
@@ -596,6 +653,126 @@ async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = f"@{r['username']}" if r["username"] else "без username"
         lines.append(f"• {r['full_name'] or 'Без имени'} ({uname}, id: {r['user_id']})")
     await update.message.reply_text("\n".join(lines) + "\n\nВернуть доступ: /unban ID")
+
+
+def access_keyboard(uid):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Впустить", callback_data=f"access:ok:{uid}"),
+                InlineKeyboardButton("⛔ Отклонить", callback_data=f"access:no:{uid}"),
+            ]
+        ]
+    )
+
+
+def describe_user(user_id, full_name, username):
+    uname = f"@{username}" if username else "без username"
+    return f"{full_name or 'Без имени'} ({uname}, id: {user_id})"
+
+
+async def request_access(bot, user):
+    # Возвращает текст для пользователя. При первом обращении уведомляет всех админов.
+    register_user(user)
+    with db() as c:
+        row = c.execute("SELECT requested_at FROM users WHERE user_id = ?", (user.id,)).fetchone()
+    if row and row["requested_at"]:
+        return PENDING_AGAIN_TEXT
+    mark_requested(user.id)
+    text = "🔔 Запрос на доступ к боту:\n" + describe_user(user.id, user.full_name, user.username)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=text, reply_markup=access_keyboard(user.id))
+        except TelegramError:
+            pass
+    return PENDING_TEXT
+
+
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # Проверка доступа для сообщений. True — человека можно обслуживать.
+    user = update.effective_user
+    if user.id in ADMIN_IDS:
+        return True
+    if is_banned(user.id):
+        await update.message.reply_text(BANNED_TEXT)
+        return False
+    if is_approved(user.id):
+        return True
+    await update.message.reply_text(await request_access(context.bot, user))
+    return False
+
+
+async def access_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in ADMIN_IDS:
+        await query.answer("Только для администратора", show_alert=True)
+        return
+    await query.answer()
+    _, action, uid_text = query.data.split(":")
+    uid = int(uid_text)
+    with db() as c:
+        row = c.execute("SELECT * FROM users WHERE user_id = ?", (uid,)).fetchone()
+    who = describe_user(uid, row["full_name"] if row else "", row["username"] if row else "")
+    if action == "ok":
+        set_approved(uid, True)
+        await query.edit_message_text(f"✅ Впущен: {who}")
+        try:
+            await say(
+                context.bot,
+                uid,
+                "✅ Администратор открыл вам доступ. Нажмите кнопку ниже, чтобы получить материалы.",
+                USER_KEYBOARD,
+            )
+        except TelegramError:
+            pass
+    else:
+        set_banned(uid, True)
+        await query.edit_message_text(f"⛔ Отклонён и заблокирован: {who}")
+
+
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    ids, bad = parse_ids(context.args)
+    if not ids:
+        await update.message.reply_text(
+            "Укажите ID: /allow 123456789\nИли несколько: /allow 111 222\n"
+            "ID можно посмотреть в /users или /pending."
+        )
+        return
+    for uid in ids:
+        set_approved(uid, True)
+        try:
+            await say(
+                context.bot,
+                uid,
+                "✅ Администратор открыл вам доступ. Нажмите кнопку ниже, чтобы получить материалы.",
+                USER_KEYBOARD,
+            )
+        except TelegramError:
+            pass  # человек ещё не писал боту — это нормально, доступ ему всё равно открыт
+    text = f"✅ Доступ открыт: {len(ids)}"
+    if bad:
+        text += "\nНе похоже на ID, пропущено: " + ", ".join(bad)
+    await update.message.reply_text(text)
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM users WHERE approved = 0 AND banned = 0 ORDER BY first_seen DESC LIMIT 20"
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Никто не ждёт одобрения.")
+        return
+    await update.message.reply_text(f"⏳ Ждут одобрения: {len(rows)}")
+    for r in rows:
+        await update.message.reply_text(
+            describe_user(r["user_id"], r["full_name"], r["username"]),
+            reply_markup=access_keyboard(r["user_id"]),
+        )
 
 
 def confirm_keyboard(action):
@@ -646,7 +823,7 @@ async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_push(bot, report_chat_id):
     with db() as c:
         users = c.execute(
-            "SELECT user_id, last_seen_id FROM users WHERE blocked = 0 AND banned = 0"
+            "SELECT user_id, last_seen_id FROM users WHERE blocked = 0 AND banned = 0 AND approved = 1"
         ).fetchall()
 
     reached = total = unreachable = 0
@@ -706,9 +883,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
-    if user.id not in ADMIN_IDS and is_banned(user.id):
-        await query.answer(BANNED_TEXT, show_alert=True)
-        return
+    if user.id not in ADMIN_IDS:
+        if is_banned(user.id):
+            await query.answer(BANNED_TEXT, show_alert=True)
+            return
+        if not is_approved(user.id):
+            reply = await request_access(context.bot, user)
+            await query.answer(reply, show_alert=True)
+            return
     await query.answer()
     register_user(user)
     touch_user(user.id, "last_request")
@@ -736,8 +918,7 @@ async def user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def content_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user.id not in ADMIN_IDS:
-        if is_banned(user.id):
-            await update.message.reply_text(BANNED_TEXT)
+        if not await gate(update, context):
             return
         register_user(user)
         await say(
@@ -854,6 +1035,9 @@ def main():
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
     app.add_handler(CommandHandler("banned", cmd_banned))
+    app.add_handler(CommandHandler("allow", cmd_allow))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:(ok|no):\d+$"))
     app.add_handler(CommandHandler("wipe", cmd_wipe))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("push", cmd_push))
